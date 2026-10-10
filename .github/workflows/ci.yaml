@@ -1,0 +1,172 @@
+# CI/CD for web, api, worker.
+#
+# Pull request: test + build (no push).
+# Push to main: test + build + push to ECR + update the image tag in the GitOps repo.
+#               Argo CD then deploys the new tag.
+#
+# Only changed services are built. A change in internal/, go.mod, go.sum or Dockerfile builds all.
+#
+# Setup (one time, see README):
+#   variable AWS_ROLE_ARN       IAM role for OIDC (terraform/envs/shared in the GitOps repo)
+#   secret   GITOPS_DEPLOY_KEY  SSH key with write access to the GitOps repo
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: # manual run: builds all services
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_PREFIX: practice-k8s
+  GITOPS_REPO: ZG77/practice-k8s-gitops
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      services: ${{ steps.list.outputs.services }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          filters: |
+            web:
+              - 'cmd/web/**'
+              - 'internal/**'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Dockerfile'
+            api:
+              - 'cmd/api/**'
+              - 'internal/**'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Dockerfile'
+            worker:
+              - 'cmd/worker/**'
+              - 'internal/**'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Dockerfile'
+      - id: list
+        env:
+          EVENT: ${{ github.event_name }}
+          CHANGED: ${{ steps.filter.outputs.changes }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo 'services=["web","api","worker"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "services=${CHANGED:-[]}" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  build:
+    needs: [changes, test]
+    if: needs.changes.outputs.services != '[]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # OIDC token for AWS
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.services) }}
+    env:
+      PUSH: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: AWS credentials (OIDC)
+        if: env.PUSH == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ECR login
+        if: env.PUSH == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            SERVICE=${{ matrix.service }}
+            VERSION=${{ github.sha }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.ecr.outputs.registry || 'local' }}/${{ env.ECR_PREFIX }}/${{ matrix.service }}:${{ github.sha }}
+          provenance: false # no extra "unknown/unknown" manifests in ECR
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy-dev:
+    needs: [changes, build]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.changes.outputs.services != '[]'
+    runs-on: ubuntu-24.04
+    environment: dev # deployment history in the GitHub UI
+    concurrency:
+      group: gitops-dev # one tag update at a time, never cancelled
+      cancel-in-progress: false
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+
+      - name: Update image tags
+        env:
+          SERVICES: ${{ needs.changes.outputs.services }}
+          TAG: ${{ github.sha }}
+        run: |
+          for svc in $(echo "$SERVICES" | jq -r '.[]'); do
+            yq -i ".image.tag = \"$TAG\"" "apps/$svc/values.yaml"
+            echo "$svc -> $TAG"
+          done
+
+      - name: Commit and push
+        env:
+          SERVICES: ${{ needs.changes.outputs.services }}
+          SHORT: ${{ github.sha }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/
+          if git diff --cached --quiet; then
+            echo "No change"; exit 0
+          fi
+          names=$(echo "$SERVICES" | jq -r 'join(",")')
+          git commit -m "deploy(dev): $names -> ${SHORT:0:7}" -m "Source: $SOURCE"
+          # Another run may push first. Rebase and retry.
+          for i in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
